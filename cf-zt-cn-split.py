@@ -163,7 +163,7 @@ TOP_CN_DOMAINS = [
 ]
 
 # 3. 国内公网 IP 数据源 (GeoIP2-CN 聚合库)
-IP_URL = "https://raw.githubusercontent.com/soffchen/GeoIP2-CN/release/CN-ip-cidr.txt"
+IP_URL = "https://raw.githubusercontent.com/metowolf/iplist/master/data/special/china.txt"
 
 
 def get_cn_cidrs():
