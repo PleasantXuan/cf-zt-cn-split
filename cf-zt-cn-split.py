@@ -1,45 +1,39 @@
+import ipaddress
 import os
-import re
 import requests
 
 CF_API_TOKEN = os.getenv("CF_API_TOKEN")
 ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID")
 PROFILE_ID = os.getenv("CF_PROFILE_ID", "")
-MODE = os.getenv("MODE", "exclude")  # exclude=CN直连 | include=只有CN走WARP
+MODE = os.getenv("MODE", "exclude")
 ALLOWED_MODES = {"exclude", "include"}
 
 if not all([CF_API_TOKEN, ACCOUNT_ID]):
-    raise ValueError(
-        "缺少环境变量！请在 GitHub Secrets 设置 CF_API_TOKEN、CF_ACCOUNT_ID"
-    )
-
-if MODE not in ALLOWED_MODES:
-    raise ValueError(
-        f"非法 MODE: {MODE}，只允许 {'/'.join(sorted(ALLOWED_MODES))}"
-    )
+  raise ValueError(
+      "缺少环境变量！请在 GitHub Secrets 设置 CF_API_TOKEN、CF_ACCOUNT_ID"
+  )
 
 HEADERS = {
     "Authorization": f"Bearer {CF_API_TOKEN}",
     "Content-Type": "application/json",
 }
 
-MAX_RULES = 4000
+# 移动端友好上限（推荐 1200 ~ 1500 条，Android 秒连且覆盖 98%+ 国内流量）
+MAX_RULES = 1610
 
-# 1. 常用本地及私有局域网 IP 段 (保证内网打印机、NAS、路由器后台直连)
+# 1. 局域网 IP
 LAN_IPS = [
     "10.0.0.0/8",
     "172.16.0.0/12",
     "192.168.0.0/16",
-    "100.64.0.0/10",  # 运营商级 NAT (CGNAT)
-    "127.0.0.0/8",  # 本地回环
-    "169.254.0.0/16",  # 链路本地地址
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
 ]
 
-# 2. 国内高频直连域名 Top 100（含 1 条 *.cn 通配规则 + 99 条核心非 .cn 域名）
+# 2. 核心域名
 TOP_CN_DOMAINS = [
-    # 顶级通配（自动覆盖所有 .cn / .com.cn / .net.cn / .edu.cn）
     "*.cn",
-    # 腾讯系
     "qq.com",
     "tencent.com",
     "myqcloud.com",
@@ -49,7 +43,6 @@ TOP_CN_DOMAINS = [
     "foxmail.com",
     "dnspod.com",
     "gameloop.com",
-    # 阿里系
     "taobao.com",
     "alicdn.com",
     "alipay.com",
@@ -69,7 +62,6 @@ TOP_CN_DOMAINS = [
     "ykimg.com",
     "1688.com",
     "cainiao.com",
-    # 字节跳动
     "bytedance.com",
     "douyin.com",
     "douyincdn.com",
@@ -83,27 +75,23 @@ TOP_CN_DOMAINS = [
     "volccdn.com",
     "feishu.net",
     "ixigua.com",
-    # 百度系
     "baidu.com",
     "bdstatic.com",
     "baidupcs.com",
     "bcebos.com",
     "baidubce.com",
     "hao123.com",
-    # 网易系
     "163.com",
     "126.net",
     "netease.com",
     "ydstatic.com",
     "163yun.com",
     "youdao.com",
-    # 哔哩哔哩
     "bilibili.com",
     "bilivideo.com",
     "hdslb.com",
     "biliapi.net",
     "biligame.com",
-    # 电商 / 生活 / 外卖
     "jd.com",
     "360buyimg.com",
     "jdcache.com",
@@ -115,7 +103,6 @@ TOP_CN_DOMAINS = [
     "vip.com",
     "vipstatic.com",
     "dewu.com",
-    # 视频 / 音频 / 直播
     "iqiyi.com",
     "iqiyipic.com",
     "mgtv.com",
@@ -128,7 +115,6 @@ TOP_CN_DOMAINS = [
     "xmcdn.com",
     "kugou.com",
     "kuwo.com",
-    # 社交 / 社区 / 资讯
     "weibo.com",
     "sina.com",
     "sinaimg.com",
@@ -139,14 +125,12 @@ TOP_CN_DOMAINS = [
     "xhscdn.com",
     "douban.com",
     "doubanio.com",
-    # 出行 / 地图
     "amap.com",
     "autonavi.com",
     "didiglobal.com",
     "didistatic.com",
     "ctrip.com",
     "qunar.com",
-    # 手机生态 / 办公 / 国内 CDN
     "mi.com",
     "xiaomi.com",
     "huawei.com",
@@ -162,28 +146,54 @@ TOP_CN_DOMAINS = [
     "upyun.com",
 ]
 
-# 3. 国内公网 IP 数据源 (GeoIP2-CN 聚合库)
-IP_URL = "https://raw.githubusercontent.com/metowolf/iplist/master/data/special/china.txt"
+IP_URL = "https://raw.githubusercontent.com/17mon/china_ip_list/master/china_ip_list.txt"
 
 
-def get_cn_cidrs():
-  """从 GeoIP2-CN 拉取聚合后的中国大陆公网 CIDR 列表"""
+def get_cn_cidrs(max_quota):
+  """拉取并利用 Python ipaddress 库进行深度超网聚合 + 大网段优先提纯"""
   r = requests.get(IP_URL, timeout=30)
   r.raise_for_status()
-  cidrs = [
+
+  raw_lines = [
       line.strip()
       for line in r.text.splitlines()
       if line.strip() and not line.startswith("#")
   ]
-  print(f"   国内公网 IP 数据源共获取到 {len(cidrs)} 条 CIDR")
-  return cidrs
+
+  # 1. 转换为 IPv4Network 对象
+  networks = []
+  for line in raw_lines:
+    try:
+      networks.append(ipaddress.ip_network(line))
+    except ValueError:
+      continue
+
+  # 2. Python 原生无损超网合并 (将相邻块合成大块)
+  collapsed_nets = list(ipaddress.collapse_addresses(networks))
+  print(
+      f"   原始条目: {len(networks)} 条 -> 无损合并后: {len(collapsed_nets)} 条"
+  )
+
+  # 3. 核心优化：按包含 IP 数量降序排列（优先保留 /8, /11, /16 等大网段）
+  collapsed_nets.sort(key=lambda net: net.num_addresses, reverse=True)
+
+  # 4. 截取前 max_quota 条最核心网段
+  selected_nets = collapsed_nets[:max_quota]
+
+  total_ips = sum(net.num_addresses for net in collapsed_nets)
+  selected_ips = sum(net.num_addresses for net in selected_nets)
+  coverage = (selected_ips / total_ips) * 100 if total_ips else 0
+
+  print(
+      f"   精简选入: {len(selected_nets)} 条大网段 | IP 实际覆盖率:"
+      f" {coverage:.2f}%"
+  )
+
+  return [str(net) for net in selected_nets]
 
 
-def update_split_tunnels(cn_cidrs):
-  # 1. 构建内网 IP 规则 (LAN)
+def update_split_tunnels():
   lan_entries = [{"address": ip, "description": "LAN IP"} for ip in LAN_IPS]
-
-  # 2. 构建域名规则 (自动补齐 *. 前缀以支持全子域匹配)
   formatted_domains = [
       d if d.startswith("*.") else f"*.{d}" for d in TOP_CN_DOMAINS
   ]
@@ -191,29 +201,19 @@ def update_split_tunnels(cn_cidrs):
       {"host": d, "description": "CN Top Domain"} for d in formatted_domains
   ]
 
-  # 3. 计算剩余配额并分配给国内公网 IP
   reserved_count = len(lan_entries) + len(domain_entries)
   available_ip_quota = max(0, MAX_RULES - reserved_count)
-  ip_entries = [
-      {"address": cidr, "description": "CN IP"}
-      for cidr in cn_cidrs[:available_ip_quota]
-  ]
 
-  # 4. 按优先级排序：内网 IP -> 核心域名 -> 国内公网 IP
+  cn_cidrs = get_cn_cidrs(available_ip_quota)
+  ip_entries = [{"address": cidr, "description": "CN IP"} for cidr in cn_cidrs]
+
   routes = lan_entries + domain_entries + ip_entries
 
   print(
-      f"   内网 IP 规则：{len(lan_entries)} 条 | 域名规则："
-      f" {len(domain_entries)} 条 | 公网 IP 规则：{len(ip_entries)} 条"
-      f" | 合计：{len(routes)} 条"
+      f"   内网 IP: {len(lan_entries)} 条 | 域名: {len(domain_entries)} 条 | 公网"
+      f" IP: {len(ip_entries)} 条 | 最终写入总数: {len(routes)} 条"
   )
 
-  # 5. 上限硬保底
-  if len(routes) > MAX_RULES:
-    print(f"⚠️ 规则总数超出 {MAX_RULES}，执行安全截断")
-    routes = routes[:MAX_RULES]
-
-  # 6. 调用 Cloudflare API 写入策略
   if PROFILE_ID:
     url = f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/devices/policy/{PROFILE_ID}/{MODE}"
   else:
@@ -229,5 +229,4 @@ def update_split_tunnels(cn_cidrs):
 
 if __name__ == "__main__":
   print("🔄 正在生成分流规则并同步至 Cloudflare...")
-  cn_cidrs = get_cn_cidrs()
-  update_split_tunnels(cn_cidrs)
+  update_split_tunnels()
